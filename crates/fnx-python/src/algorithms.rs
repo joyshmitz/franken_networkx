@@ -810,12 +810,20 @@ fn multigraph_to_simple_graph(mg: &fnx_classes::MultiGraph) -> fnx_classes::Grap
         let attrs = mg.node_attrs(node).cloned().unwrap_or_default();
         g.add_node_with_attrs(node.to_owned(), attrs);
     }
-    for edge in mg.edges_ordered() {
-        // Only add the first parallel edge (skip duplicates)
-        if !g.has_edge(&edge.left, &edge.right) {
-            let _ = g.add_edge_with_attrs(edge.left, edge.right, edge.attrs);
+    let borrowed = mg.edges_ordered_borrowed();
+    let mut seen = HashSet::<(&str, &str)>::with_capacity(borrowed.len());
+    let mut survivors: Vec<(String, String, AttrMap)> = Vec::with_capacity(borrowed.len());
+    for &(left, right, _key, attrs) in &borrowed {
+        let pair = if left <= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        if seen.insert(pair) {
+            survivors.push((left.to_owned(), right.to_owned(), attrs.clone()));
         }
     }
+    g.extend_edges_with_attrs_unrecorded(survivors);
     g.apply_row_orders(&mg_row_orders(mg)); // restore source row orders (u-major walk hoists)
     g.set_runtime_policy(runtime_policy);
     g
@@ -1632,21 +1640,30 @@ fn multigraph_to_pagerank_simple_graph(
 ) -> fnx_classes::Graph {
     let runtime_policy = mg.runtime_policy().clone();
     let mut g = fnx_classes::Graph::with_runtime_policy(runtime_policy.clone());
-    let mut weights = HashMap::<(String, String), f64>::new();
 
     for node in mg.nodes_ordered() {
         let attrs = mg.node_attrs(node).cloned().unwrap_or_default();
         g.add_node_with_attrs(node.to_owned(), attrs);
     }
 
-    for edge in mg.edges_ordered() {
-        let pair = (edge.left.clone(), edge.right.clone());
-        *weights.entry(pair).or_insert(0.0) += pagerank_projected_weight(&edge.attrs, weight_attr);
+    let borrowed = mg.edges_ordered_borrowed();
+    let mut weights = HashMap::<(&str, &str), f64>::with_capacity(borrowed.len());
+    for &(left, right, _key, attrs) in &borrowed {
+        *weights.entry((left, right)).or_insert(0.0) +=
+            pagerank_projected_weight(attrs, weight_attr);
     }
 
-    for ((left, right), weight) in weights {
-        let _ = g.add_edge_with_attrs(left, right, pagerank_weight_attrs(weight));
-    }
+    let survivors: Vec<(String, String, AttrMap)> = weights
+        .into_iter()
+        .map(|((left, right), weight)| {
+            (
+                left.to_owned(),
+                right.to_owned(),
+                pagerank_weight_attrs(weight),
+            )
+        })
+        .collect();
+    g.extend_edges_with_attrs_unrecorded(survivors);
 
     g.apply_row_orders(&mg_row_orders(mg)); // restore source row orders (u-major walk hoists)
     g.set_runtime_policy(runtime_policy);
@@ -1659,21 +1676,30 @@ fn multidigraph_to_pagerank_simple_digraph(
 ) -> fnx_classes::digraph::DiGraph {
     let runtime_policy = mdg.runtime_policy().clone();
     let mut dg = fnx_classes::digraph::DiGraph::with_runtime_policy(runtime_policy.clone());
-    let mut weights = HashMap::<(String, String), f64>::new();
 
     for node in mdg.nodes_ordered() {
         let attrs = mdg.node_attrs(node).cloned().unwrap_or_default();
         dg.add_node_with_attrs(node.to_owned(), attrs);
     }
 
-    for edge in mdg.edges_ordered() {
-        let pair = (edge.source.clone(), edge.target.clone());
-        *weights.entry(pair).or_insert(0.0) += pagerank_projected_weight(&edge.attrs, weight_attr);
+    let borrowed = mdg.edges_ordered_borrowed();
+    let mut weights = HashMap::<(&str, &str), f64>::with_capacity(borrowed.len());
+    for &(source, target, _key, attrs) in &borrowed {
+        *weights.entry((source, target)).or_insert(0.0) +=
+            pagerank_projected_weight(attrs, weight_attr);
     }
 
-    for ((source, target), weight) in weights {
-        let _ = dg.add_edge_with_attrs(source, target, pagerank_weight_attrs(weight));
-    }
+    let survivors: Vec<(String, String, AttrMap)> = weights
+        .into_iter()
+        .map(|((source, target), weight)| {
+            (
+                source.to_owned(),
+                target.to_owned(),
+                pagerank_weight_attrs(weight),
+            )
+        })
+        .collect();
+    let _ = dg.extend_edges_with_attrs_unrecorded(survivors);
 
     {
         let (succ_orders, pred_orders) = mdg_row_orders(mdg);
@@ -1754,11 +1780,15 @@ fn multidigraph_to_simple_digraph(
         let attrs = mdg.node_attrs(node).cloned().unwrap_or_default();
         dg.add_node_with_attrs(node.to_owned(), attrs);
     }
-    for edge in mdg.edges_ordered() {
-        if !dg.has_edge(&edge.source, &edge.target) {
-            let _ = dg.add_edge_with_attrs(edge.source, edge.target, edge.attrs);
+    let borrowed = mdg.edges_ordered_borrowed();
+    let mut seen = HashSet::<(&str, &str)>::with_capacity(borrowed.len());
+    let mut survivors: Vec<(String, String, AttrMap)> = Vec::with_capacity(borrowed.len());
+    for &(source, target, _key, attrs) in &borrowed {
+        if seen.insert((source, target)) {
+            survivors.push((source.to_owned(), target.to_owned(), attrs.clone()));
         }
     }
+    let _ = dg.extend_edges_with_attrs_unrecorded(survivors);
     {
         let (succ_orders, pred_orders) = mdg_row_orders(mdg);
         dg.apply_row_orders(&succ_orders, false);
@@ -1837,37 +1867,38 @@ fn multidigraph_to_weighted_simple_digraph(
 ) -> fnx_classes::digraph::DiGraph {
     let runtime_policy = mdg.runtime_policy().clone();
     let mut dg = fnx_classes::digraph::DiGraph::with_runtime_policy(runtime_policy.clone());
-    let mut selected = HashMap::<(String, String), (f64, usize)>::new();
 
     for node in mdg.nodes_ordered() {
         let attrs = mdg.node_attrs(node).cloned().unwrap_or_default();
         dg.add_node_with_attrs(node.to_owned(), attrs);
     }
 
-    for edge in mdg.edges_ordered() {
-        let pair = (edge.source.clone(), edge.target.clone());
-        let candidate_weight = projected_weight(&edge.attrs, weight_attr);
-        match selected.get_mut(&pair) {
+    let borrowed = mdg.edges_ordered_borrowed();
+    let mut selected = HashMap::<(&str, &str), (f64, usize)>::with_capacity(borrowed.len());
+    for &(source, target, key, attrs) in &borrowed {
+        let candidate_weight = projected_weight(attrs, weight_attr);
+        match selected.get_mut(&(source, target)) {
             Some((best_weight, best_key)) if candidate_weight < *best_weight => {
                 *best_weight = candidate_weight;
-                *best_key = edge.key;
+                *best_key = key;
             }
             None => {
-                selected.insert(pair, (candidate_weight, edge.key));
+                selected.insert((source, target), (candidate_weight, key));
             }
             _ => {}
         }
     }
 
-    for edge in mdg.edges_ordered() {
-        let pair = (edge.source.clone(), edge.target.clone());
+    let mut survivors: Vec<(String, String, AttrMap)> = Vec::with_capacity(selected.len());
+    for &(source, target, key, attrs) in &borrowed {
         if selected
-            .get(&pair)
-            .is_some_and(|(_, selected_key)| *selected_key == edge.key)
+            .get(&(source, target))
+            .is_some_and(|(_, selected_key)| *selected_key == key)
         {
-            let _ = dg.add_edge_with_attrs(edge.source, edge.target, edge.attrs);
+            survivors.push((source.to_owned(), target.to_owned(), attrs.clone()));
         }
     }
+    let _ = dg.extend_edges_with_attrs_unrecorded(survivors);
 
     {
         let (succ_orders, pred_orders) = mdg_row_orders(mdg);
@@ -2446,9 +2477,8 @@ fn spanning_input_graph(
         sanitized.add_node(node.to_owned());
     }
 
-    for edge in inner.edges_ordered() {
-        let has_nan_weight = edge
-            .attrs
+    for (left, right, edge_attrs_map) in inner.edges_ordered_borrowed() {
+        let has_nan_weight = edge_attrs_map
             .get(weight)
             .and_then(|weight_value| weight_value.as_f64())
             .is_some_and(f64::is_nan);
@@ -2457,9 +2487,9 @@ fn spanning_input_graph(
                 continue;
             }
 
-            let py_u = gr.py_node_key(py, &edge.left);
-            let py_v = gr.py_node_key(py, &edge.right);
-            let edge_attrs = match gr.edge_attrs_for_undirected(&edge.left, &edge.right) {
+            let py_u = gr.py_node_key(py, left);
+            let py_v = gr.py_node_key(py, right);
+            let edge_attrs = match gr.edge_attrs_for_undirected(left, right) {
                 Some(attrs) => attrs.bind(py).copy()?,
                 None => PyDict::new(py),
             };
@@ -2472,8 +2502,7 @@ fn spanning_input_graph(
             )));
         }
 
-        let attrs = edge
-            .attrs
+        let attrs = edge_attrs_map
             .get(weight)
             .map_or_else(AttrMap::new, |weight_value| {
                 let mut attrs = AttrMap::new();
@@ -2482,7 +2511,7 @@ fn spanning_input_graph(
             });
 
         sanitized
-            .add_edge_with_attrs(edge.left, edge.right, attrs)
+            .add_edge_with_attrs(left, right, attrs)
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
     }
 
@@ -2498,16 +2527,15 @@ fn spanning_input_graph(
 /// the O(V+E) construction tax that dominated the previous binding.
 fn validate_spanning_no_nan(py: Python<'_>, gr: &GraphRef<'_>, weight: &str) -> PyResult<()> {
     let inner = gr.undirected();
-    for edge in inner.edges_ordered() {
-        let has_nan_weight = edge
-            .attrs
+    for (left, right, edge_attrs_map) in inner.edges_ordered_borrowed() {
+        let has_nan_weight = edge_attrs_map
             .get(weight)
             .and_then(|weight_value| weight_value.as_f64())
             .is_some_and(f64::is_nan);
         if has_nan_weight {
-            let py_u = gr.py_node_key(py, &edge.left);
-            let py_v = gr.py_node_key(py, &edge.right);
-            let edge_attrs = match gr.edge_attrs_for_undirected(&edge.left, &edge.right) {
+            let py_u = gr.py_node_key(py, left);
+            let py_v = gr.py_node_key(py, right);
+            let edge_attrs = match gr.edge_attrs_for_undirected(left, right) {
                 Some(attrs) => attrs.bind(py).copy()?,
                 None => PyDict::new(py),
             };
@@ -2634,8 +2662,8 @@ fn extract_edge_partition_from_attr(
 ) -> PyResult<(Vec<(String, String)>, Vec<(String, String)>)> {
     let mut included = Vec::new();
     let mut excluded = Vec::new();
-    for edge in dg.inner.edges_ordered() {
-        let key = PyDiGraph::edge_key(&edge.left, &edge.right);
+    for (left, right, _) in dg.inner.edges_ordered_borrowed() {
+        let key = PyDiGraph::edge_key(left, right);
         let Some(attrs) = dg.edge_py_attrs.get(&key) else {
             continue;
         };
@@ -2650,10 +2678,10 @@ fn extract_edge_partition_from_attr(
         let raw = value_str.to_str()?;
         match raw {
             "EdgePartition.INCLUDED" | "INCLUDED" | "Included" | "included" => {
-                included.push((edge.left.clone(), edge.right.clone()));
+                included.push((left.to_owned(), right.to_owned()));
             }
             "EdgePartition.EXCLUDED" | "EXCLUDED" | "Excluded" | "excluded" => {
-                excluded.push((edge.left.clone(), edge.right.clone()));
+                excluded.push((left.to_owned(), right.to_owned()));
             }
             _ => {}
         }
@@ -2667,9 +2695,9 @@ fn shuffled_spanning_edges_with_random(
     random: &Bound<'_, PyAny>,
 ) -> PyResult<SpanningEdgeSamples> {
     let edge_items = inner
-        .edges_ordered()
+        .edges_ordered_borrowed()
         .into_iter()
-        .map(|edge| (edge.left, edge.right))
+        .map(|(left, right, _)| (left.to_owned(), right.to_owned()))
         .collect::<Vec<_>>();
     let edge_list = PyList::new(py, &edge_items)?;
     random.call_method1("shuffle", (&edge_list,))?;
@@ -10726,9 +10754,9 @@ pub fn random_spanning_tree(
             }
         })?;
     let edge_pairs = result
-        .edges_ordered()
+        .edges_ordered_borrowed()
         .into_iter()
-        .map(|edge| (edge.left, edge.right))
+        .map(|(left, right, _)| (left.to_owned(), right.to_owned()))
         .collect::<Vec<_>>();
     undirected_spanning_edges_to_pygraph(py, pg, &edge_pairs)
 }
@@ -11489,27 +11517,27 @@ pub fn stochastic_graph_normalize_digraph_inplace(
         Err(_) => return Ok(false),
     };
 
-    let edges = graph.inner.edges_ordered();
+    let edges = graph.inner.edges_ordered_borrowed();
     let mut degrees: HashMap<String, f64> = HashMap::with_capacity(graph.inner.node_count());
     let mut edge_weights: Vec<(String, String, f64)> = Vec::with_capacity(edges.len());
 
-    for edge in &edges {
-        let edge_key = (edge.left.clone(), edge.right.clone());
+    for &(left, right, attrs) in &edges {
+        let edge_key = (left.to_owned(), right.to_owned());
         let value = match graph.edge_py_attrs.get(&edge_key) {
-            Some(attrs) => match attrs.bind(py).get_item(weight)? {
+            Some(py_attrs) => match py_attrs.bind(py).get_item(weight)? {
                 Some(value) => match py_stochastic_numeric(&value) {
                     Some(value) => value,
                     None => return Ok(false),
                 },
                 None => 1.0,
             },
-            None => match cgse_stochastic_numeric(edge.attrs.get(weight)) {
+            None => match cgse_stochastic_numeric(attrs.get(weight)) {
                 Some(value) => value,
                 None => return Ok(false),
             },
         };
-        *degrees.entry(edge.left.clone()).or_insert(0.0) += value;
-        edge_weights.push((edge.left.clone(), edge.right.clone(), value));
+        *degrees.entry(edge_key.0.clone()).or_insert(0.0) += value;
+        edge_weights.push((edge_key.0, edge_key.1, value));
     }
 
     for (source, target, value) in edge_weights {
@@ -11552,27 +11580,27 @@ pub fn stochastic_graph_normalize_multidigraph_inplace(
         Err(_) => return Ok(false),
     };
 
-    let edges = graph.inner.edges_ordered();
+    let edges = graph.inner.edges_ordered_borrowed();
     let mut degrees: HashMap<String, f64> = HashMap::with_capacity(graph.inner.node_count());
     let mut edge_weights: Vec<(String, String, usize, f64)> = Vec::with_capacity(edges.len());
 
-    for edge in &edges {
-        let edge_key = (edge.source.clone(), edge.target.clone(), edge.key);
+    for &(source, target, key, attrs) in &edges {
+        let edge_key = (source.to_owned(), target.to_owned(), key);
         let value = match graph.edge_py_attrs.get(&edge_key) {
-            Some(attrs) => match attrs.bind(py).get_item(weight)? {
+            Some(py_attrs) => match py_attrs.bind(py).get_item(weight)? {
                 Some(value) => match py_stochastic_numeric(&value) {
                     Some(value) => value,
                     None => return Ok(false),
                 },
                 None => 1.0,
             },
-            None => match cgse_stochastic_numeric(edge.attrs.get(weight)) {
+            None => match cgse_stochastic_numeric(attrs.get(weight)) {
                 Some(value) => value,
                 None => return Ok(false),
             },
         };
-        *degrees.entry(edge.source.clone()).or_insert(0.0) += value;
-        edge_weights.push((edge.source.clone(), edge.target.clone(), edge.key, value));
+        *degrees.entry(edge_key.0.clone()).or_insert(0.0) += value;
+        edge_weights.push((edge_key.0, edge_key.1, edge_key.2, value));
     }
 
     for (source, target, key, value) in edge_weights {
@@ -15712,10 +15740,10 @@ pub fn condensation(py: Python<'_>, g: &Bound<'_, PyAny>) -> PyResult<(PyObject,
                 .insert(node.to_owned(), pyo3::types::PyDict::new(py).unbind());
             py_dg.inner.add_node(node);
         }
-        for edge in cond_graph.edges_ordered() {
-            let _ = py_dg.inner.add_edge(&edge.left, &edge.right);
+        for (left, right, _) in cond_graph.edges_ordered_borrowed() {
+            let _ = py_dg.inner.add_edge(left, right);
             py_dg.edge_py_attrs.insert(
-                (edge.left, edge.right),
+                (left.to_owned(), right.to_owned()),
                 pyo3::types::PyDict::new(py).unbind(),
             );
         }
@@ -16177,10 +16205,10 @@ pub fn transitive_reduction(py: Python<'_>, g: &Bound<'_, PyAny>) -> PyResult<Py
                         .insert(node.to_owned(), pyo3::types::PyDict::new(py).unbind());
                     py_dg.inner.add_node(node);
                 }
-                for edge in result.edges_ordered() {
-                    let _ = py_dg.inner.add_edge(&edge.left, &edge.right);
+                for (left, right, _) in result.edges_ordered_borrowed() {
+                    let _ = py_dg.inner.add_edge(left, right);
                     py_dg.edge_py_attrs.insert(
-                        (edge.left, edge.right),
+                        (left.to_owned(), right.to_owned()),
                         pyo3::types::PyDict::new(py).unbind(),
                     );
                 }
@@ -16645,9 +16673,9 @@ fn rust_graph_to_py(
             .insert(node.to_owned(), pyo3::types::PyDict::new(py).unbind());
         py_graph.inner.add_node(node);
     }
-    for edge in result.edges_ordered() {
-        let _ = py_graph.inner.add_edge(&edge.left, &edge.right);
-        let ek = PyGraph::edge_key(&edge.left, &edge.right);
+    for (left, right, _) in result.edges_ordered_borrowed() {
+        let _ = py_graph.inner.add_edge(left, right);
+        let ek = PyGraph::edge_key(left, right);
         py_graph
             .edge_py_attrs
             .insert(ek, pyo3::types::PyDict::new(py).unbind());
@@ -16686,9 +16714,9 @@ fn rust_graph_to_py_binary(
             .insert(node.to_owned(), pyo3::types::PyDict::new(py).unbind());
         py_graph.inner.add_node(node);
     }
-    for edge in result.edges_ordered() {
-        let _ = py_graph.inner.add_edge(&edge.left, &edge.right);
-        let ek = PyGraph::edge_key(&edge.left, &edge.right);
+    for (left, right, _) in result.edges_ordered_borrowed() {
+        let _ = py_graph.inner.add_edge(left, right);
+        let ek = PyGraph::edge_key(left, right);
         py_graph
             .edge_py_attrs
             .insert(ek, pyo3::types::PyDict::new(py).unbind());
@@ -16711,12 +16739,10 @@ fn rust_graph_to_py_with_source_edge_attrs(
             .insert(node.to_owned(), pyo3::types::PyDict::new(py).unbind());
         py_graph.inner.add_node(node);
     }
-    for edge in result.edges_ordered() {
-        let _ = py_graph.inner.add_edge(&edge.left, &edge.right);
-        let ek = PyGraph::edge_key(&edge.left, &edge.right);
-        let attrs = if let Some(source_attrs) =
-            source_gr.edge_attrs_for_undirected(&edge.left, &edge.right)
-        {
+    for (left, right, _) in result.edges_ordered_borrowed() {
+        let _ = py_graph.inner.add_edge(left, right);
+        let ek = PyGraph::edge_key(left, right);
+        let attrs = if let Some(source_attrs) = source_gr.edge_attrs_for_undirected(left, right) {
             source_attrs.bind(py).copy()?.unbind()
         } else {
             pyo3::types::PyDict::new(py).unbind()
@@ -16799,10 +16825,10 @@ fn rust_graph_to_py_subgraph(
         py_graph.node_py_attrs.insert(node.to_owned(), attrs);
         py_graph.inner.add_node(node);
     }
-    for edge in result.edges_ordered() {
-        let _ = py_graph.inner.add_edge(&edge.left, &edge.right);
-        let ek = PyGraph::edge_key(&edge.left, &edge.right);
-        let attrs = match source_gr.edge_attrs_for_undirected(&edge.left, &edge.right) {
+    for (left, right, _) in result.edges_ordered_borrowed() {
+        let _ = py_graph.inner.add_edge(left, right);
+        let ek = PyGraph::edge_key(left, right);
+        let attrs = match source_gr.edge_attrs_for_undirected(left, right) {
             Some(d) => d.bind(py).copy()?.unbind(),
             None => PyDict::new(py).unbind(),
         };
@@ -16836,15 +16862,15 @@ fn rust_digraph_to_py_subgraph(
         py_graph.node_py_attrs.insert(node.to_owned(), attrs);
         py_graph.inner.add_node(node);
     }
-    for edge in result.edges_ordered() {
-        let _ = py_graph.inner.add_edge(&edge.left, &edge.right);
-        let attrs = match source_gr.edge_attrs_for_directed(&edge.left, &edge.right) {
+    for (left, right, _) in result.edges_ordered_borrowed() {
+        let _ = py_graph.inner.add_edge(left, right);
+        let attrs = match source_gr.edge_attrs_for_directed(left, right) {
             Some(d) => d.bind(py).copy()?.unbind(),
             None => PyDict::new(py).unbind(),
         };
         py_graph
             .edge_py_attrs
-            .insert((edge.left.clone(), edge.right.clone()), attrs);
+            .insert((left.to_owned(), right.to_owned()), attrs);
     }
     Ok(py_graph.into_pyobject(py)?.into_any().unbind())
 }
@@ -19260,15 +19286,15 @@ fn undirected_isomorphism_mappings(
     let mut adj1 = vec![vec![false; n]; n];
     let mut adj2 = vec![vec![false; n]; n];
 
-    for edge in g1.edges_ordered() {
-        let i = idx1[edge.left.as_str()];
-        let j = idx1[edge.right.as_str()];
+    for (left, right, _) in g1.edges_ordered_borrowed() {
+        let i = idx1[left];
+        let j = idx1[right];
         adj1[i][j] = true;
         adj1[j][i] = true;
     }
-    for edge in g2.edges_ordered() {
-        let i = idx2[edge.left.as_str()];
-        let j = idx2[edge.right.as_str()];
+    for (left, right, _) in g2.edges_ordered_borrowed() {
+        let i = idx2[left];
+        let j = idx2[right];
         adj2[i][j] = true;
         adj2[j][i] = true;
     }
@@ -19406,14 +19432,14 @@ fn directed_isomorphism_mappings(
     let mut adj1 = vec![vec![false; n]; n];
     let mut adj2 = vec![vec![false; n]; n];
 
-    for edge in g1.edges_ordered() {
-        let i = idx1[edge.left.as_str()];
-        let j = idx1[edge.right.as_str()];
+    for (left, right, _) in g1.edges_ordered_borrowed() {
+        let i = idx1[left];
+        let j = idx1[right];
         adj1[i][j] = true;
     }
-    for edge in g2.edges_ordered() {
-        let i = idx2[edge.left.as_str()];
-        let j = idx2[edge.right.as_str()];
+    for (left, right, _) in g2.edges_ordered_borrowed() {
+        let i = idx2[left];
+        let j = idx2[right];
         adj2[i][j] = true;
     }
 
@@ -27019,12 +27045,12 @@ pub fn moral_graph_rust(py: Python<'_>, g: &Bound<'_, PyAny>) -> PyResult<PyObje
     let result = py.allow_threads(|| fnx_algorithms::moral_graph(dg));
 
     let mut edge_attr_map: HashMap<(String, String), Py<PyDict>> = HashMap::new();
-    for e in dg.edges_ordered() {
-        let attrs = match gr.edge_attrs_for_directed(&e.left, &e.right) {
+    for (left, right, _) in dg.edges_ordered_borrowed() {
+        let attrs = match gr.edge_attrs_for_directed(left, right) {
             Some(d) => d.bind(py).copy()?.unbind(),
             None => PyDict::new(py).unbind(),
         };
-        edge_attr_map.insert(PyGraph::edge_key(&e.left, &e.right), attrs);
+        edge_attr_map.insert(PyGraph::edge_key(left, right), attrs);
     }
 
     let mut py_graph =
@@ -27041,9 +27067,9 @@ pub fn moral_graph_rust(py: Python<'_>, g: &Bound<'_, PyAny>) -> PyResult<PyObje
         py_graph.node_py_attrs.insert(node.to_owned(), attrs);
         py_graph.inner.add_node(node);
     }
-    for edge in result.edges_ordered() {
-        let _ = py_graph.inner.add_edge(&edge.left, &edge.right);
-        let ek = PyGraph::edge_key(&edge.left, &edge.right);
+    for (left, right, _) in result.edges_ordered_borrowed() {
+        let _ = py_graph.inner.add_edge(left, right);
+        let ek = PyGraph::edge_key(left, right);
         let attrs = match edge_attr_map.remove(&ek) {
             Some(d) => d,
             None => PyDict::new(py).unbind(),
