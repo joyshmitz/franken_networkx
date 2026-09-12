@@ -940,9 +940,9 @@ impl PyMultiDiGraph {
         if !valid {
             let edges: Vec<(String, String, usize)> = self
                 .inner
-                .edges_ordered()
+                .edges_ordered_borrowed()
                 .into_iter()
-                .map(|edge| (edge.source.to_owned(), edge.target.to_owned(), edge.key))
+                .map(|(source, target, key, _)| (source.to_owned(), target.to_owned(), key))
                 .collect();
             let mut result: Vec<PyObject> = Vec::with_capacity(edges.len());
             for (source, target, key) in &edges {
@@ -9545,27 +9545,23 @@ impl PyMultiDiGraph {
             }
         }
 
-        for edge in self.inner.edges_ordered() {
-            let u = &edge.source;
-            let v = &edge.target;
-            let k = edge.key;
-
-            let mut rust_attrs = edge.attrs.clone();
+        for (u, v, k, attrs) in self.inner.edges_ordered_borrowed() {
+            let mut rust_attrs = attrs.clone();
 
             let mut py_attrs_copy = None;
-            if let Some(py_attrs) = self.edge_py_attrs.get(&(u.clone(), v.clone(), k)) {
+            if let Some(py_attrs) = self.edge_py_attrs.get(&(u.to_owned(), v.to_owned(), k)) {
                 py_attrs_copy = Some(py_attrs.bind(py).copy()?.unbind());
                 rust_attrs.extend(crate::py_dict_to_attr_map(py_attrs.bind(py))?);
             }
 
             let new_k = ug
                 .inner
-                .add_edge_with_key_and_attrs(u.clone(), v.clone(), k, rust_attrs)
+                .add_edge_with_key_and_attrs(u, v, k, rust_attrs)
                 .map_err(|e| crate::NetworkXError::new_err(e.to_string()))?;
 
             if let Some(pa) = py_attrs_copy {
-                let u_undir = if u < v { u.clone() } else { v.clone() };
-                let v_undir = if u < v { v.clone() } else { u.clone() };
+                let u_undir = if u < v { u.to_owned() } else { v.to_owned() };
+                let v_undir = if u < v { v.to_owned() } else { u.to_owned() };
                 ug.edge_py_attrs.insert((u_undir, v_undir, new_k), pa);
             }
             ug.remember_edge_key_object(py, u, v, new_k, &self.py_edge_key(py, u, v, k));
@@ -10139,15 +10135,15 @@ impl PyMultiDiGraph {
 
         let edges_list: Vec<(PyObject, PyObject, PyObject, Py<PyDict>)> = self
             .inner
-            .edges_ordered()
+            .edges_ordered_borrowed()
             .into_iter()
-            .map(|edge| {
-                let py_u = self.py_node_key(py, &edge.source);
-                let py_v = self.py_node_key(py, &edge.target);
-                let py_key = self.py_edge_key(py, &edge.source, &edge.target, edge.key);
+            .map(|(source, target, key, _)| {
+                let py_u = self.py_node_key(py, source);
+                let py_v = self.py_node_key(py, target);
+                let py_key = self.py_edge_key(py, source, target, key);
                 let attrs = self
                     .edge_py_attrs
-                    .get(&Self::edge_key(&edge.source, &edge.target, edge.key))
+                    .get(&Self::edge_key(source, target, key))
                     .map_or_else(|| PyDict::new(py).unbind(), |d| d.clone_ref(py));
                 (py_u, py_v, py_key, attrs)
             })
@@ -10617,8 +10613,8 @@ impl MultiDiGraphEdgeView {
         let key_obj = tuple.get_item(2)?;
         let key: usize = key_obj.extract().unwrap_or(usize::MAX);
         // Check if this key exists by looking at all edges
-        for edge in g.inner.edges_ordered() {
-            if edge.source.as_str() == u && edge.target.as_str() == v && edge.key == key {
+        for (source, target, k, _) in g.inner.edges_ordered_borrowed() {
+            if source == u && target == v && k == key {
                 return Ok(true);
             }
         }
@@ -14833,19 +14829,18 @@ impl PyDiGraph {
         }
         let _ = rev.inner.extend_nodes_with_attrs_unrecorded(node_batch);
         let mut edge_batch: Vec<(String, String, fnx_classes::AttrMap)> = Vec::new();
-        for edge in self.inner.edges_ordered() {
-            let u = &edge.left;
-            let v = &edge.right;
+        for (u, v, attrs) in self.inner.edges_ordered_borrowed() {
             let edge_key = Self::edge_key(u, v);
-            let rust_attrs = if let Some(attrs) = self.edge_py_attrs.get(&edge_key) {
-                let copied = attrs.bind(py).copy()?.unbind();
+            let rust_attrs = if let Some(attrs_py) = self.edge_py_attrs.get(&edge_key) {
+                let copied = attrs_py.bind(py).copy()?.unbind();
                 let am = py_dict_to_attr_map(copied.bind(py))?;
-                rev.edge_py_attrs.insert((v.clone(), u.clone()), copied);
+                rev.edge_py_attrs
+                    .insert((v.to_owned(), u.to_owned()), copied);
                 am
             } else {
-                edge.attrs.clone()
+                attrs.clone()
             };
-            edge_batch.push((v.clone(), u.clone(), rust_attrs));
+            edge_batch.push((v.to_owned(), u.to_owned(), rust_attrs));
         }
         let _ = rev.inner.extend_edges_with_attrs_unrecorded(edge_batch);
         Ok(rev)
@@ -14876,11 +14871,9 @@ impl PyDiGraph {
         // iterated the `edge_py_attrs` HashMap (non-deterministic order) and kept
         // the FIRST-seen direction, so the reciprocal-edge winner was random and
         // diverged from nx depending on the process's hash seed.
-        for snapshot in self.inner.edges_ordered() {
-            let u = snapshot.left;
-            let v = snapshot.right;
-            let ek = PyGraph::edge_key(&u, &v);
-            let src = self.edge_py_attrs.get(&(u.clone(), v.clone()));
+        for (u, v, _) in self.inner.edges_ordered_borrowed() {
+            let ek = PyGraph::edge_key(u, v);
+            let src = self.edge_py_attrs.get(&(u.to_owned(), v.to_owned()));
             if let Some(d) = src
                 && !d.bind(py).is_empty()
             {
@@ -18037,11 +18030,11 @@ impl PyDiGraph {
         // edge insertion order instead.
         let edges_list: Vec<(PyObject, PyObject, Py<PyDict>)> = self
             .inner
-            .edges_ordered()
+            .edges_ordered_borrowed()
             .into_iter()
-            .map(|edge| -> PyResult<_> {
-                let py_u = self.py_node_key(py, &edge.left);
-                let py_v = self.py_node_key(py, &edge.right);
+            .map(|(left, right, attrs)| -> PyResult<_> {
+                let py_u = self.py_node_key(py, left);
+                let py_v = self.py_node_key(py, right);
                 // br-r37-c1-getstate-storemiss (cc): a MISSING mirror entry does NOT
                 // mean empty attrs — bulk/non-fresh add_edges_from stores attrs in the
                 // CgseValue store and leaves edge_py_attrs empty. The old
@@ -18050,12 +18043,9 @@ impl PyDiGraph {
                 // edges-with-attrs -> pickle -> every edge came back {}). Fall back to
                 // the store's AttrMap (edge.attrs from edges_ordered) so the round-trip
                 // preserves them.
-                let attrs = match self
-                    .edge_py_attrs
-                    .get(&Self::edge_key(&edge.left, &edge.right))
-                {
+                let attrs = match self.edge_py_attrs.get(&Self::edge_key(left, right)) {
                     Some(d) => d.clone_ref(py),
-                    None => crate::attr_map_to_pydict(py, &edge.attrs)?,
+                    None => crate::attr_map_to_pydict(py, attrs)?,
                 };
                 Ok((py_u, py_v, attrs))
             })
@@ -19561,8 +19551,8 @@ mod tests {
             baseline.inner.nodes_ordered()
         );
         assert_eq!(
-            candidate.inner.edges_ordered(),
-            baseline.inner.edges_ordered()
+            candidate.inner.edges_ordered_borrowed(),
+            baseline.inner.edges_ordered_borrowed()
         );
         assert_eq!(
             node_map_snapshot(py, &candidate.node_key_map)?,
@@ -19621,11 +19611,16 @@ mod tests {
             assert_eq!(candidate.nodes_seq, baseline.nodes_seq);
             assert_eq!(candidate.edges_seq, baseline.edges_seq);
 
-            for edge in candidate.inner.edges_ordered() {
-                let candidate_attrs =
-                    candidate.materialize_edge_py_attrs(py, &edge.left, &edge.right);
-                let baseline_attrs =
-                    baseline.materialize_edge_py_attrs(py, &edge.left, &edge.right);
+            let edges: Vec<(String, String)> = candidate
+                .inner
+                .edges_ordered_borrowed()
+                .into_iter()
+                .map(|(left, right, _)| (left.to_owned(), right.to_owned()))
+                .collect();
+
+            for (left, right) in &edges {
+                let candidate_attrs = candidate.materialize_edge_py_attrs(py, left, right);
+                let baseline_attrs = baseline.materialize_edge_py_attrs(py, left, right);
                 assert_eq!(
                     candidate_attrs.bind(py).repr()?.to_string(),
                     baseline_attrs.bind(py).repr()?.to_string()
@@ -21467,9 +21462,9 @@ def fnx_keyed_attr_edges(mixed):
             let reversed = graph.reverse(py).expect("reverse should succeed");
             let edges = reversed
                 .inner
-                .edges_ordered()
+                .edges_ordered_borrowed()
                 .into_iter()
-                .map(|edge| (edge.left, edge.right))
+                .map(|(left, right, _)| (left.to_owned(), right.to_owned()))
                 .collect::<Vec<_>>();
 
             assert_eq!(
@@ -21507,9 +21502,9 @@ def fnx_keyed_attr_edges(mixed):
             let reversed = graph.reverse(py).expect("reverse should succeed");
             let edges = reversed
                 .inner
-                .edges_ordered()
+                .edges_ordered_borrowed()
                 .into_iter()
-                .map(|edge| (edge.source, edge.target, edge.key))
+                .map(|(source, target, key, _)| (source.to_owned(), target.to_owned(), key))
                 .collect::<Vec<_>>();
 
             assert_eq!(

@@ -14295,6 +14295,7 @@ impl PyMultiGraph {
         let edges_list: Vec<(PyObject, PyObject, PyObject, Py<PyDict>)> = self
             .inner
             .edges_ordered_borrowed()
+            .into_iter()
             .map(|(left, right, key, _)| {
                 let py_u = self.py_node_key(py, left);
                 let py_v = self.py_adj_key(py, left, right) /* br-r37-c1-z6uka */;
@@ -15044,6 +15045,7 @@ impl MultiGraphEdgeView {
         let edges: Vec<(String, String, usize)> = g
             .inner
             .edges_ordered_borrowed()
+            .into_iter()
             .map(|(left, right, key, _)| (left.to_owned(), right.to_owned(), key))
             .collect();
         for (left, right, key) in &edges {
@@ -16864,6 +16866,7 @@ impl PyGraph {
         let edges: Vec<(String, String)> = self
             .inner
             .edges_ordered_borrowed()
+            .into_iter()
             .map(|(left, right, _)| (left.to_owned(), right.to_owned()))
             .collect();
         for (u, v) in edges {
