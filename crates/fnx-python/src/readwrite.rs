@@ -18,12 +18,7 @@ use fnx_readwrite::{DiReadWriteReport, EdgeListEngine, ReadWriteError, ReadWrite
 use fnx_runtime::CompatibilityMode;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyByteArray;
-use pyo3::types::PyBytes;
-use pyo3::types::PyDict;
-use pyo3::types::PyInt;
-use pyo3::types::PyList;
-use pyo3::types::PyString;
+use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2382,16 +2377,83 @@ pub fn adjacency_arrays_multigraph_finite_checked(
     Ok(Some((rows, cols, data)))
 }
 
-fn finite_py_weight(raw: &Bound<'_, PyAny>) -> Option<f64> {
+fn finite_py_weight_typed(raw: &Bound<'_, PyAny>) -> Option<(f64, bool)> {
+    if raw.is_exact_instance_of::<PyBool>() {
+        let b = raw.extract::<bool>().ok()?;
+        return Some((if b { 1.0 } else { 0.0 }, false));
+    }
+    if raw.is_instance_of::<PyFloat>() {
+        let val = raw.extract::<f64>().ok()?;
+        return val.is_finite().then_some((val, true));
+    }
+    if raw.is_instance_of::<PyInt>() {
+        let val = raw.extract::<f64>().ok()?;
+        return val.is_finite().then_some((val, false));
+    }
     if let Ok(value) = raw.extract::<f64>() {
-        return value.is_finite().then_some(value);
+        if !value.is_finite() {
+            return None;
+        }
+        let is_int = raw.extract::<i64>().is_ok();
+        return Some((value, !is_int));
     }
     if let Ok(value) = raw.extract::<String>()
         && let Ok(parsed) = value.parse::<f64>()
     {
-        return parsed.is_finite().then_some(parsed);
+        return parsed.is_finite().then_some((parsed, true));
     }
     None
+}
+
+fn stored_multigraph_weight_typed(
+    attrs: &fnx_classes::AttrMap,
+    weight_attr: &str,
+    default_weight: f64,
+) -> Option<(f64, bool)> {
+    match attrs.get(weight_attr) {
+        Some(fnx_runtime::CgseValue::Float(f)) => f.is_finite().then_some((*f, true)),
+        Some(fnx_runtime::CgseValue::Int(i)) => {
+            let val = *i as f64;
+            val.is_finite().then_some((val, false))
+        }
+        Some(fnx_runtime::CgseValue::Bool(b)) => Some((if *b { 1.0 } else { 0.0 }, false)),
+        Some(fnx_runtime::CgseValue::String(s)) => s
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| (v, true)),
+        Some(fnx_runtime::CgseValue::Map(_)) => None,
+        None => Some((default_weight, default_weight.fract() != 0.0)),
+    }
+}
+
+fn stored_multigraph_weight(
+    attrs: &fnx_classes::AttrMap,
+    weight_attr: &str,
+    default_weight: f64,
+) -> Option<f64> {
+    stored_multigraph_weight_typed(attrs, weight_attr, default_weight).map(|(w, _)| w)
+}
+
+fn live_multigraph_weight_typed(
+    py: Python<'_>,
+    mirror: Option<&Py<PyDict>>,
+    attrs: &fnx_classes::AttrMap,
+    weight_attr: &str,
+    default_weight: f64,
+) -> PyResult<Option<(f64, bool)>> {
+    if let Some(dict) = mirror {
+        let bound = dict.bind(py);
+        return match bound.get_item(weight_attr)? {
+            Some(raw) => Ok(finite_py_weight_typed(&raw)),
+            None => Ok(Some((default_weight, default_weight.fract() != 0.0))),
+        };
+    }
+    Ok(stored_multigraph_weight_typed(
+        attrs,
+        weight_attr,
+        default_weight,
+    ))
 }
 
 fn live_multigraph_weight(
@@ -2401,28 +2463,10 @@ fn live_multigraph_weight(
     weight_attr: &str,
     default_weight: f64,
 ) -> PyResult<Option<f64>> {
-    if let Some(dict) = mirror {
-        let bound = dict.bind(py);
-        return match bound.get_item(weight_attr)? {
-            Some(raw) => Ok(finite_py_weight(&raw)),
-            None => Ok(Some(default_weight)),
-        };
-    }
-    Ok(match attrs.get(weight_attr) {
-        Some(raw) => raw.as_f64().filter(|value| value.is_finite()),
-        None => Some(default_weight),
-    })
-}
-
-fn stored_multigraph_weight(
-    attrs: &fnx_classes::AttrMap,
-    weight_attr: &str,
-    default_weight: f64,
-) -> Option<f64> {
-    match attrs.get(weight_attr) {
-        Some(raw) => raw.as_f64().filter(|value| value.is_finite()),
-        None => Some(default_weight),
-    }
+    Ok(
+        live_multigraph_weight_typed(py, mirror, attrs, weight_attr, default_weight)?
+            .map(|(w, _)| w),
+    )
 }
 
 fn borrowed_multidigraph_dirty_keys(
@@ -2441,6 +2485,37 @@ fn cloned_multidigraph_dirty_keys(
     Ok(mdg.cloned_current_edge_dirty_keys())
 }
 
+fn multidigraph_weight_with_precise_dirty_typed(
+    py: Python<'_>,
+    mdg: &crate::digraph::PyMultiDiGraph,
+    precise_dirty_keys: Option<&HashSet<(&str, &str, usize)>>,
+    u: &str,
+    v: &str,
+    key: usize,
+    attrs: &fnx_classes::AttrMap,
+    weight_attr: &str,
+    default_weight: f64,
+) -> PyResult<Option<(f64, bool)>> {
+    if let Some(dirty_keys) = precise_dirty_keys
+        && !dirty_keys.contains(&(u, v, key))
+    {
+        return Ok(stored_multigraph_weight_typed(
+            attrs,
+            weight_attr,
+            default_weight,
+        ));
+    }
+
+    let mirror_key = (u.to_owned(), v.to_owned(), key);
+    live_multigraph_weight_typed(
+        py,
+        mdg.edge_py_attrs.get(&mirror_key),
+        attrs,
+        weight_attr,
+        default_weight,
+    )
+}
+
 fn multidigraph_weight_with_precise_dirty(
     py: Python<'_>,
     mdg: &crate::digraph::PyMultiDiGraph,
@@ -2452,20 +2527,18 @@ fn multidigraph_weight_with_precise_dirty(
     weight_attr: &str,
     default_weight: f64,
 ) -> PyResult<Option<f64>> {
-    if let Some(dirty_keys) = precise_dirty_keys
-        && !dirty_keys.contains(&(u, v, key))
-    {
-        return Ok(stored_multigraph_weight(attrs, weight_attr, default_weight));
-    }
-
-    let mirror_key = (u.to_owned(), v.to_owned(), key);
-    live_multigraph_weight(
+    Ok(multidigraph_weight_with_precise_dirty_typed(
         py,
-        mdg.edge_py_attrs.get(&mirror_key),
+        mdg,
+        precise_dirty_keys,
+        u,
+        v,
+        key,
         attrs,
         weight_attr,
         default_weight,
-    )
+    )?
+    .map(|(w, _)| w))
 }
 
 /// br-r37-c1-wvuf7: live-dict sibling of
@@ -2809,6 +2882,18 @@ impl CsrDataBytes {
         Self::Integral(Vec::with_capacity(capacity))
     }
 
+    fn promote_to_float(&mut self) {
+        if let Self::Integral(values) = self {
+            let previous_values = std::mem::take(values);
+            let mut bytes =
+                Vec::with_capacity((previous_values.len() + 1) * std::mem::size_of::<f64>());
+            for previous in previous_values {
+                append_csr_f64_bytes(&mut bytes, previous as f64);
+            }
+            *self = Self::Float(bytes);
+        }
+    }
+
     fn push(&mut self, value: f64) {
         match self {
             Self::Integral(values) => {
@@ -2937,6 +3022,9 @@ pub fn adjacency_csr_bytes_multidigraph_default_order_live_finite_checked(
     let mut indptr: Vec<u8> = Vec::with_capacity((node_count + 1) * intp_width);
     let mut indices: Vec<u8> = Vec::with_capacity(inner.edge_count() * intp_width);
     let mut data = CsrDataBytes::with_capacity(inner.edge_count());
+    if default_weight.fract() != 0.0 {
+        data.promote_to_float();
+    }
     append_csr_intp_bytes(&mut indptr, 0)?;
 
     let use_stored_attrs = !mdg.edges_dirty.load(Ordering::Relaxed);
@@ -2962,9 +3050,9 @@ pub fn adjacency_csr_bytes_multidigraph_default_order_live_finite_checked(
     let build_result: Result<(), CsrBuildStop> =
         inner.try_for_each_indexed_edge_ordered_borrowed(|ui, vi, u, v, key, attrs| {
             let w = if use_stored_attrs {
-                stored_multigraph_weight(attrs, weight_attr, default_weight)
+                stored_multigraph_weight_typed(attrs, weight_attr, default_weight)
             } else {
-                multidigraph_weight_with_precise_dirty(
+                multidigraph_weight_with_precise_dirty_typed(
                     py,
                     mdg,
                     precise_dirty_keys.as_ref(),
@@ -2977,9 +3065,12 @@ pub fn adjacency_csr_bytes_multidigraph_default_order_live_finite_checked(
                 )
                 .map_err(CsrBuildStop::Error)?
             };
-            let Some(w) = w else {
+            let Some((w, is_float)) = w else {
                 return Err(CsrBuildStop::Unsupported);
             };
+            if is_float {
+                data.promote_to_float();
+            }
 
             while current_row < ui {
                 if let Some((col, value)) = pending.take() {
@@ -3055,14 +3146,15 @@ pub fn adjacency_csr_bytes_multigraph_default_order_live_finite_checked(
 
     let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); node_count];
     let use_stored_attrs = !mg.edges_dirty.load(Ordering::Relaxed);
+    let mut saw_float = default_weight.fract() != 0.0;
     for (u, v, key, attrs) in inner.edges_ordered_borrowed() {
         let Some(&ui) = index.get(u) else { continue };
         let Some(&vi) = index.get(v) else { continue };
         let w = if use_stored_attrs {
-            stored_multigraph_weight(attrs, weight_attr, default_weight)
+            stored_multigraph_weight_typed(attrs, weight_attr, default_weight)
         } else {
             let mirror_key = PyMultiGraph::edge_key(u, v, key);
-            live_multigraph_weight(
+            live_multigraph_weight_typed(
                 py,
                 mg.edge_py_attrs.get(&mirror_key),
                 attrs,
@@ -3070,9 +3162,12 @@ pub fn adjacency_csr_bytes_multigraph_default_order_live_finite_checked(
                 default_weight,
             )?
         };
-        let Some(w) = w else {
+        let Some((w, is_float)) = w else {
             return Ok(None);
         };
+        if is_float {
+            saw_float = true;
+        }
         rows[ui].push((vi, w));
         if ui != vi {
             rows[vi].push((ui, w));
@@ -3083,6 +3178,9 @@ pub fn adjacency_csr_bytes_multigraph_default_order_live_finite_checked(
     let mut indptr: Vec<u8> = Vec::with_capacity((node_count + 1) * intp_width);
     let mut indices: Vec<u8> = Vec::with_capacity(inner.edge_count() * intp_width * 2);
     let mut data = CsrDataBytes::with_capacity(inner.edge_count() * 2);
+    if saw_float {
+        data.promote_to_float();
+    }
     let mut emitted = 0usize;
     append_csr_intp_bytes(&mut indptr, emitted)?;
     for row in &mut rows {

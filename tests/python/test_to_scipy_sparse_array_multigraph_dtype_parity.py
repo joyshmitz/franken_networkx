@@ -62,13 +62,6 @@ def test_dtype_matches_networkx(cls, label, weights):
 
 
 @pytest.mark.parametrize("cls", ["MultiGraph", "MultiDiGraph"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="br-r37-c1-p80x1: the multigraph CSR kernel reports data_is_int from the summed "
-    "VALUES, so integral-valued FLOAT weights yield int64 where networkx yields float64. "
-    "Fixing it means changing what the kernel reports (Rust); a Python-side repair would "
-    "need an O(|E|) weight scan and would cost the fast path its purpose.",
-)
 def test_integral_float_weights_keep_float_dtype(cls):
     got = fnx.to_scipy_sparse_array(_build(fnx, cls, (2.0, 3.0)))
     expected = nx.to_scipy_sparse_array(_build(nx, cls, (2.0, 3.0)))
